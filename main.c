@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <mpi.h>
 
 #include "util.h"
@@ -37,6 +38,12 @@ int main(int argc, char **argv) {
     // Obter o caminho da imagem e a operação a ser realizada
     strncpy(image_path, argv[1], MAX_PATH_LENGTH);
     operation = atoi(argv[2]);
+
+    // Imprimir o caminho da imagem e a operação
+    if (rank == 0) {
+        printf("Caminho da imagem: %s\n", image_path);
+        printf("Operação a ser realizada: %d\n", operation);
+    }
 
     // Carregar a imagem
     int *image = (int *)malloc(IMAGE_WIDTH * IMAGE_HEIGHT * sizeof(int));
