@@ -12,9 +12,11 @@ Funcionalidades
 ---------------
 
 *   Implementação de algoritmos paralelos para:
-    *   Filtros de imagem
-    *   Segmentação de imagem
-    *   Outras operações de processamento de imagem
+
+    *   Filtro de média e mediana
+    *   Transformação de cisalhamento
+    *   Filtro de Realce
+
 *   Suporte para processamento em múltiplos núcleos
 *   Suporte para processamento distribuído em clusters de computadores
   
