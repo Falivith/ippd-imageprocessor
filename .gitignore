@@ -1,6 +1,7 @@
 main
 .vscode
 .DS_Store
+result_images/*
 # Prerequisites
 *.d
 

@@ -4,10 +4,51 @@
 #include <functional>
 #include <chrono>
 #include <omp.h>
+#include <fstream>
+#include <filesystem>
 
 using namespace std;
 using namespace std::chrono;
 using namespace cv;
+using namespace std::filesystem;
+
+#define MAX_THREADS 4
+
+Mat createHighlightKernel(int size) {
+    CV_Assert(size % 2 == 1); // Size should be odd to have a central element
+    Mat kernel = Mat::ones(size, size, CV_32F) / (float)(size * size);
+    float centerValue = 0.5f; // You can adjust the center value as needed
+    kernel.at<float>(size / 2, size / 2) = centerValue;
+    return kernel;
+}
+
+void write_csv(const string& filename, const string& image_name, const string& process, int kernel_size, double executionTime) {
+    ofstream file;
+    bool file_exists = exists(filename);
+    file.open(filename, ios::app);
+
+    if (!file_exists) {
+        file << "image,type,kernel_size,time\n";
+    }
+
+    file << image_name << "," << process << "," << kernel_size << "," << executionTime << "\n";
+
+    file.close();
+}
+
+void load_image_names(vector<string> &image_names) {
+    try {
+        for (const auto &entry : directory_iterator("images")) {
+            if (entry.is_regular_file()) {
+                image_names.push_back(entry.path().string());
+            }
+        }
+    } catch (const filesystem_error& e) {
+        std::cerr << "Filesystem error: " << e.what() << '\n';
+    } catch (const std::exception& e) {
+        std::cerr << "General error: " << e.what() << '\n';
+    }
+}
 
 template<typename Func, typename... Args>
 double measureExecutionTime(Func func, Args&&... args) {
@@ -20,17 +61,19 @@ double measureExecutionTime(Func func, Args&&... args) {
     return time_span.count();
 }
 
-uchar mean(Mat region, int kernelSize) {
+float mean(Mat region, int kernelSize) {
     int sum = 0;
+    #pragma omp parallel for reduction(+:sum) collapse(2)
     for (int i = 0; i < kernelSize; i++) {
         for (int j = 0; j < kernelSize; j++) {
             sum += region.at<uchar>(i, j);
+            cout << sum << endl;
         }
     }
-    return (uchar) sum / (kernelSize * kernelSize);
+    return sum / (kernelSize * kernelSize);
 }
 
-uchar median(Mat region, int kernelSize) {
+float median(Mat region, int kernelSize) {
     int size = kernelSize * kernelSize;
     int *values = new int[size];
     int k = 0;
@@ -40,120 +83,105 @@ uchar median(Mat region, int kernelSize) {
         }
     }
     sort(values, values + size);
-    return (uchar) values[size / 2];
+    return values[size / 2];
 }
 
 
-void border(Mat image, int verticalOffset, int horizontalOffset, Mat result) {
-    // cria borda
-    #pragma omp parallel for
-    for (int i = verticalOffset; i < image.rows + verticalOffset; i++) {
-        for (int j = horizontalOffset; j < image.cols + horizontalOffset; j++) {
-            result.at<uchar>(i, j) = image.at<uchar>(i - verticalOffset, j - horizontalOffset);
+void border(const Mat& image, int offset, Mat& result) {
+    int newRows = image.rows + 2 * offset;
+    int newCols = image.cols + 2 * offset;
+    result = Mat::zeros(newRows, newCols, image.type());
+
+    #pragma omp parallel for collapse(2) num_threads(MAX_THREADS)
+    for (int i = offset; i < image.rows + offset; i++) {
+        for (int j = offset; j < image.cols + offset; j++) {
+            result.at<uchar>(i, j) = image.at<uchar>(i - offset, j - offset);
         }
     }
 
-    #pragma omp parallel for
-    for (int i = 0; i < verticalOffset; i++) {
-        for (int j = 0; j < result.cols; j++) {
-            result.at<uchar>(i, j) = result.at<uchar>(verticalOffset, j);
+    #pragma omp parallel for collapse(2) num_threads(MAX_THREADS)
+    for (int i = 0; i < offset; i++) {
+        for (int j = 0; j < newCols; j++) {
+            result.at<uchar>(i, j) = result.at<uchar>(offset, j);
+            result.at<uchar>(newRows - 1 - i, j) = result.at<uchar>(newRows - 1 - offset, j);
         }
     }
 
-    #pragma omp parallel for
-    for (int i = result.rows - verticalOffset; i < result.rows; i++) {
-        for (int j = 0; j < result.cols; j++) {
-            result.at<uchar>(i, j) = result.at<uchar>(result.rows - verticalOffset - 1, j);
-        }
-    }
-
-    #pragma omp parallel for
-    for (int i = 0; i < result.rows; i++) {
-        for (int j = 0; j < horizontalOffset; j++) {
-            result.at<uchar>(i, j) = result.at<uchar>(i, horizontalOffset);
-        }
-    }
-
-    #pragma omp parallel for
-    for (int i = 0; i < result.rows; i++) {
-        for (int j = result.cols - horizontalOffset; j < result.cols; j++) {
-            result.at<uchar>(i, j) = result.at<uchar>(i, result.cols - horizontalOffset - 1);
+    #pragma omp parallel for collapse(2) num_threads(MAX_THREADS)
+    for (int i = 0; i < newRows; i++) {
+        for (int j = 0; j < offset; j++) {
+            result.at<uchar>(i, j) = result.at<uchar>(i, offset);
+            result.at<uchar>(i, newCols - 1 - j) = result.at<uchar>(i, newCols - 1 - offset);
         }
     }
 }
 
-void meanFilter(Mat image, Mat kernel) {
-    int kernelHeight = kernel.rows;
-    int kernelWidth = kernel.cols;
+void convolute(Mat& image, const Mat& kernel) {
+    CV_Assert(image.channels() == 1);
 
-    int verticalOffset = floor(kernelHeight / 2);
-    int horizontalOffset = floor(kernelWidth / 2);
+    int offset = kernel.rows / 2;
+    Mat paddedImage;
+    border(image, offset, paddedImage);
 
-    Size resultSize(image.cols + horizontalOffset*2, image.rows + verticalOffset*2);
+    Mat result = Mat::zeros(image.size(), image.type());
+
+    #pragma omp parallel for collapse(2)
+    for (int i = offset; i < paddedImage.rows - offset; ++i) {
+        for (int j = offset; j < paddedImage.cols - offset; ++j) {
+            float sum = 0.0f;
+            for (int k = -offset; k <= offset; ++k) {
+                for (int l = -offset; l <= offset; ++l) {
+                    sum += paddedImage.at<uchar>(i + k, j + l) * kernel.at<float>(k + offset, l + offset);
+                }
+            }
+            sum = std::min(std::max(sum, 0.0f), 255.0f);
+            result.at<uchar>(i - offset, j - offset) = static_cast<uchar>(sum);
+        }
+    }
+    image = result;
+}
+
+void meanFilter(Mat& image, int kernel_size) {
+    Mat kernel = Mat::ones(kernel_size, kernel_size, CV_32F) / (float)(kernel_size * kernel_size);
+    convolute(image, kernel);
+}
+
+void medianFilter(Mat image, int kernel_size) {
+    int offset = floor(kernel_size / 2);
+
+    Size resultSize(image.cols + offset*2, image.rows + offset*2);
 
     Mat result = Mat::ones(resultSize, image.type());
     
-    border(image, verticalOffset, horizontalOffset, result);
+    border(image, offset, result);
 
-    #pragma omp parallel for
-    for (int i = verticalOffset; i < image.rows + verticalOffset; i++) {
-        for (int j = horizontalOffset; j < image.cols + horizontalOffset; j++) {
-            Mat region = result(Rect(j - horizontalOffset, i - verticalOffset, kernelWidth, kernelHeight));
-            image.at<uchar>(i - verticalOffset, j - horizontalOffset) = mean(region, kernelWidth);
+    #pragma omp parallel for collapse(2) num_threads(MAX_THREADS)
+    for (int i = offset; i < image.rows + offset; i++) {
+        for (int j = offset; j < image.cols + offset; j++) {
+            Mat region = result(Rect(j - offset, i - offset, kernel_size, kernel_size));
+            image.at<uchar>(i - offset, j - offset) = median(region, kernel_size);
         }
     }
-    
 }
 
-void medianFilter(Mat image, Mat kernel) {
-    int kernelHeight = kernel.rows;
-    int kernelWidth = kernel.cols;
+void transformImage(Mat& image, const Mat& matrix) {
+    Size newSize = image.size();
+    Mat transformedImage = Mat::zeros(newSize, image.type());
 
-    int verticalOffset = floor(kernelHeight / 2);
-    int horizontalOffset = floor(kernelWidth / 2);
+    Point2f srcCenter(image.cols / 2.0F, image.rows / 2.0F);
+    Point2f dstCenter(newSize.width / 2.0F, newSize.height / 2.0F);
 
-    Size resultSize(image.cols + horizontalOffset*2, image.rows + verticalOffset*2);
+    #pragma omp parallel for collapse(2) num_threads(MAX_THREADS)
+    for (int y = 0; y < newSize.height; y++) {
+        for (int x = 0; x < newSize.width; x++) {
+            Mat dstCoords = (Mat_<float>(3, 1) << x - dstCenter.x, y - dstCenter.y, 1);
+            Mat srcCoords = matrix * dstCoords;
 
-    Mat result = Mat::ones(resultSize, image.type());
-    
-    border(image, verticalOffset, horizontalOffset, result);
+            float x_src = srcCoords.at<float>(0, 0) + srcCenter.x;
+            float y_src = srcCoords.at<float>(1, 0) + srcCenter.y;
 
-    #pragma omp parallel for
-    for (int i = verticalOffset; i < image.rows + verticalOffset; i++) {
-        for (int j = horizontalOffset; j < image.cols + horizontalOffset; j++) {
-            Mat region = result(Rect(j - horizontalOffset, i - verticalOffset, kernelWidth, kernelHeight));
-            image.at<uchar>(i - verticalOffset, j - horizontalOffset) = median(region, kernelWidth);
-        }
-    }
-    
-}
-
-
-void transform(Mat image, Mat matrix) {
-    Mat transformedImage(image.rows, image.cols, image.type());
-
-    for (int y = 0; y < image.rows; y++) {
-        for (int x = 0; x < image.cols; x++) {
-            float x_transformed = matrix.at<float>(0, 0) * x + matrix.at<float>(0, 1) * y + matrix.at<float>(0, 2);
-            float y_transformed = matrix.at<float>(1, 0) * x + matrix.at<float>(1, 1) * y + matrix.at<float>(1, 2);
-
-            if (x_transformed >= 0 && x_transformed < image.cols && y_transformed >= 0 && y_transformed < image.rows) {
-                int x1 = floor(x_transformed);
-                int y1 = floor(y_transformed);
-                int x2 = x1 + 1;
-                int y2 = y1 + 1;
-
-                float alpha = x_transformed - x1;
-                float beta = y_transformed - y1;
-
-                float interpolated_value = 
-
-                (1 - alpha) * (1 - beta) * image.at<uchar>(y1, x1) + 
-                alpha * (1 - beta) * image.at<uchar>(y1, x2) + 
-                (1 - alpha) * beta * image.at<uchar>(y2, x1) +
-                alpha * beta * image.at<uchar>(y2, x2);
-
-                transformedImage.at<uchar>(y, x) = (uchar)interpolated_value;
+            if (x_src >= 0 && x_src < image.cols && y_src >= 0 && y_src < image.rows) {
+                transformedImage.at<uchar>(y, x) = image.at<uchar>((int)y_src, (int)x_src);
             }
         }
     }
