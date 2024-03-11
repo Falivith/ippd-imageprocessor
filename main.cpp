@@ -12,16 +12,11 @@ int main(int argc, char **argv) {
 
     MPI_Init(&argc, &argv);
 
+    double start_time = MPI_Wtime();
+
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    if (argc != 2) {
-        if (rank == 0)
-            cerr << "Uso: " << argv[0] << " <caminho_para_imagem>" << endl;
-        MPI_Finalize();
-        return 1;
-    }
 
     std::vector<std::string> image_names;
     load_image_names(image_names);
@@ -101,8 +96,17 @@ int main(int argc, char **argv) {
         write_csv(csv_filename, number, "schear", 0, executionTime);
         imwrite(result_folder + number + "_schear.bmp", schearImage);
     }
-    
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    double end_time = MPI_Wtime();
     MPI_Finalize();
+
+    double total_time = end_time - start_time;
+
+    if (rank == 0) {
+        write_csv("batch_processing_results.csv", "image_processing", "a", 0, total_time);
+        cout << "Total execution time: " << total_time << " seconds" << endl;
+    }
     
     return 0;
 }
